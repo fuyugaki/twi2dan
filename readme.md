@@ -1,0 +1,191 @@
+# twi2dan
+
+Download media from a Twitter/X post and sort it into a folder named after the Danbooru artist tag.
+
+```
+╭─────────────────────────────────────────────╮
+│ twi2dan  Twitter/X → Danbooru artist folder │
+╰─────────────────────────────────────────────╯
+```
+
+---
+
+## How it works
+
+1. Downloads all media from the tweet via **gallery-dl**
+2. Submits each image to **IQDB** for reverse image search
+3. Fetches the matched Danbooru post and extracts the artist tag
+4. Falls back to searching Danbooru by the Twitter handle if IQDB finds nothing
+5. Falls back to the Twitter handle itself as the folder name if all else fails
+6. Moves files to `<output_dir>/<artist_name>/`
+
+Multi-image tweets are handled correctly — all images land in the same artist folder. Subsequent downloads from the same artist accumulate in the same folder. Duplicate filenames get a `_1`, `_2` suffix.
+
+---
+
+## Requirements
+
+- Python 3.10+
+- [gallery-dl](https://github.com/mikf/gallery-dl)
+
+```
+pip install -r requirements.txt
+```
+
+---
+
+## Setup
+
+### 1. Twitter/X auth
+
+gallery-dl needs a logged-in session to download age-restricted content.
+
+**Option A — import browser cookies (easiest):**
+```
+gallery-dl --cookies-from-browser chrome
+gallery-dl --cookies-from-browser firefox
+```
+Run once while logged into X. Make sure NSFW content is enabled in your account settings first:
+> Settings → Privacy and Safety → Display of sensitive media → enable all
+
+**Option B — `auth_token` cookie (more stable, expires less frequently):**
+
+1. Open `x.com`, open DevTools (`F12`)
+2. Go to **Application → Cookies → https://x.com**
+3. Copy the value of `auth_token`
+4. Add to your gallery-dl config file:
+
+   - Windows: `%APPDATA%/gallery-dl/config.json`
+   - Linux/macOS: `~/.config/gallery-dl/config.json`
+
+```json
+{
+  "extractor": {
+    "twitter": {
+      "cookies": { "auth_token": "YOUR_TOKEN_HERE" }
+    }
+  }
+}
+```
+
+### 2. Danbooru credentials (optional)
+
+Not required, but recommended to avoid rate limits on the API.
+
+Credentials are stored in `.twi2dan.json` in the same folder as the script and prompted on first run.
+
+Alternatively, set environment variables:
+```
+# Windows
+set DANBOORU_USER=yourname
+set DANBOORU_API_KEY=yourkey
+
+# Linux/macOS
+export DANBOORU_USER=yourname
+export DANBOORU_API_KEY=yourkey
+```
+
+Your API key is available at: `https://danbooru.donmai.us/users/[YOUR ID]/api_keys`
+
+---
+
+## Usage
+
+### Interactive mode
+```
+python twi2dan.py
+```
+Prompts for output directory, then accepts URLs one per line. Empty line starts processing.
+
+```
+Output directory (C:\Users\you\Downloads):
+Paste tweet URLs one per line. Multiple URLs supported. Empty line when done. Type /help for help.
+Tweet URL (empty when done): https://x.com/artist/status/123456789
+Tweet URL (empty when done): https://x.com/artist/status/987654321
+Tweet URL (empty when done):
+```
+
+### Command line
+```
+python twi2dan.py <url> [url ...]
+python twi2dan.py <url> [url ...] --output-dir PATH
+```
+
+Examples:
+```
+python twi2dan.py https://x.com/someartist/status/123456789
+python twi2dan.py https://x.com/a/status/111 https://x.com/b/status/222 --output-dir D:\art
+```
+
+### In-app help
+Type `/help` at the URL prompt for usage, credential setup, and library links.
+
+---
+
+## Output structure
+
+```
+Downloads/
+├── artist_name/
+│   ├── FxK9mZ3aQAA1b2C.jpg
+│   ├── FxK9mZ3aQAA1b2D.jpg   ← multi-image tweet
+│   └── Gy7nPq2bRAB3c4E.png   ← later download, same artist
+└── another_artist/
+    └── Hz8oQr3cSBC4d5F.jpg
+```
+
+---
+
+## Troubleshooting
+
+### `'Unavailable'` error
+The tweet is age-restricted and gallery-dl couldn’t access it.
+
+1. Make sure NSFW is enabled in your X account settings
+2. Refresh cookies: `gallery-dl --cookies-from-browser chrome`
+3. Or set `auth_token` directly in gallery-dl config (see Setup above)
+
+### `HTTP Error 401` / `Unauthorized`
+Your cookies have expired. Re-run:
+```
+gallery-dl --cookies-from-browser chrome
+```
+
+### `HTTP Error 403`
+Cookies may be from a logged-out session or a restricted account. Log into X in your browser first, then re-import.
+
+### Tweet not found (404)
+The tweet was deleted or the URL is wrong.
+
+### Artist not identified
+IQDB didn’t have the image indexed (common for very new posts) and the artist’s Twitter handle wasn’t linked on their Danbooru profile. The Twitter handle is used as the folder name in this case. You can rename the folder manually once you identify the artist.
+
+### Danbooru rate limit (429)
+Add your Danbooru credentials — anonymous API access is limited to 2 requests/second and can be cut off during heavy use.
+
+---
+
+## Files
+
+| File | Description |
+|---|---|
+| `twi2dan.py` | Main script |
+| `.twi2dan.json` | Saved Danbooru credentials (same folder as script) |
+| `requirements.txt` | Python dependencies |
+
+---
+
+## Dependencies
+
+| Library | Purpose |
+|---|---|
+| [gallery-dl](https://github.com/mikf/gallery-dl) | Twitter/X media downloader |
+| [IQDB](https://iqdb.org) | Reverse image search for anime art |
+| [Danbooru](https://danbooru.donmai.us) | Anime image board and artist database |
+| [requests](https://docs.python-requests.org) | HTTP client |
+| [BeautifulSoup4](https://www.crummy.com/software/BeautifulSoup) | HTML parser |
+| [Rich](https://github.com/Textualize/rich) | Terminal formatting |
+
+---
+
+© fuyugaki, 2026 — Support your artists and developers!

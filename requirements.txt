@@ -1,0 +1,4 @@
+requests
+gallery-dl
+beautifulsoup4
+rich

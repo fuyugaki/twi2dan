@@ -1,0 +1,14 @@
+# Credentials
+.env
+.env.local
+.twi2dan.json
+
+# Python virtual environment
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
