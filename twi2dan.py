@@ -418,6 +418,7 @@ def run(tweet_url: str, output_base: Path):
 
     artist_name      = None
     danbooru_post_url = None
+    download_error    = None
     session = danbooru_session()
 
     with Progress(
@@ -431,9 +432,15 @@ def run(tweet_url: str, output_base: Path):
         with tempfile.TemporaryDirectory(prefix="twi2dan_") as tmp:
             tmp_path = Path(tmp)
 
-            # Download
+            # Download — a failure here is non-fatal: we still create the
+            # artist folder so the user has somewhere to drop files manually.
             progress.update(task, description="[blue]Downloading media…[/]")
-            files = download_with_gallery_dl(tweet_url, tmp_path, progress, task)
+            try:
+                files = download_with_gallery_dl(tweet_url, tmp_path, progress, task)
+            except AppError as e:
+                download_error = str(e).strip("'\"")
+                files = []
+                progress.update(task, description=f"[yellow]⚠ Download failed:[/] {download_error}")
 
             # IQDB reverse search
             image_files = [f for f in files if f.suffix.lower() in IMAGE_EXTENSIONS]
@@ -445,10 +452,11 @@ def run(tweet_url: str, output_base: Path):
                         danbooru_post_url = post_url
                         break
                     time.sleep(1)
-            else:
+            elif not download_error:
                 progress.update(task, description="[yellow]⚠ No images to reverse-search (video only?)[/]")
 
-            # Danbooru artist lookup
+            # Danbooru artist lookup — without images, IQDB can't run, so we
+            # fall back to the Twitter-handle searches to name the folder.
             if danbooru_post_url:
                 artist_name = artist_from_danbooru_post(danbooru_post_url, session, progress, task)
 
@@ -459,15 +467,23 @@ def run(tweet_url: str, output_base: Path):
                 progress.update(task, description="[yellow]⚠ Artist unknown — using Twitter handle[/]")
                 artist_name = twitter_user.lower()
 
-            # Move files
-            progress.update(task, description=f"[blue]Moving files →[/] [bold]{artist_name}[/]")
+            # Create the artist folder and move any downloaded files into it.
             artist_folder = output_base / artist_name
-            moved = move_files_to_folder(files, artist_folder)
+            if files:
+                progress.update(task, description=f"[blue]Moving files →[/] [bold]{artist_name}[/]")
+                moved = move_files_to_folder(files, artist_folder)
+                if not moved:
+                    raise AppError("No files were saved — all moves failed. Check output directory permissions.")
+            else:
+                # No media downloaded — still create the (empty) artist folder.
+                progress.update(task, description=f"[blue]Creating folder →[/] [bold]{artist_name}[/]")
+                ensure_output_dir(artist_folder)
+                moved = []
 
-            if not moved:
-                raise AppError("No files were saved — all moves failed. Check output directory permissions.")
-
-            progress.update(task, description=f"[green]✓ Done[/] {timestamp()}")
+            if download_error:
+                progress.update(task, description=f"[yellow]⚠ Folder created, download failed[/] {timestamp()}")
+            else:
+                progress.update(task, description=f"[green]✓ Done[/] {timestamp()}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     console.print()
@@ -482,8 +498,12 @@ def run(tweet_url: str, output_base: Path):
         table.add_row("Post", f"[link={danbooru_post_url}]{danbooru_post_url}[/link]")
     table.add_row("Folder", str(artist_folder))
     table.add_row("Files",  str(len(moved)))
+    if download_error:
+        table.add_row("Download", f"[yellow]failed — {download_error}[/]")
     console.print(table)
     console.print()
+    if download_error:
+        console.print(f"  [yellow]⚠ No media downloaded — folder created empty for manual use.[/]")
     for f in moved:
         console.print(f"  [dim]→[/] [green]{f.name}[/]")
 
