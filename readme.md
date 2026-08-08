@@ -21,6 +21,28 @@ Download media from a Twitter/X post and sort it into a folder named after the D
 
 Multi-image tweets are handled correctly — all images land in the same artist folder. Subsequent downloads from the same artist accumulate in the same folder. Duplicate filenames get a `_1`, `_2` suffix.
 
+### Artist lookups are cached per session
+
+The first time a handle is resolved to a Danbooru artist (step 3 or 4 above), the link is remembered for the rest of the run. Every further URL from that same account goes straight to the known folder — no IQDB upload, no Danbooru query:
+
+```
+──────────────────────────────── 2/4 ────────────────────────────────
+
+  14:22:07 @someartist
+  14:22:07 artist already resolved this session → sakimichan
+
+✓ Reusing artist sakimichan (cached this session)
+```
+
+Batch-downloading twenty tweets from one artist therefore costs one lookup instead of twenty, which keeps you well clear of IQDB and Danbooru rate limits.
+
+Two details worth knowing:
+
+- Handles that Danbooru has **no** artist entry for are also remembered, so that search isn’t repeated — but IQDB still runs on each tweet, since it identifies the *image* rather than the account. A late-indexed image can still resolve the artist mid-batch.
+- If the artist couldn’t be identified at all and the Twitter handle was used as the folder name, nothing is cached — the next tweet gets a full lookup.
+
+The cache lives in memory only and is empty again on the next run.
+
 ---
 
 ## Requirements

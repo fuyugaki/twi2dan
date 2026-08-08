@@ -7,6 +7,9 @@ Lookup chain for artist name:
   2. Danbooru artist URL search by Twitter handle              (fallback)
   3. Twitter handle as folder name                             (last resort)
 
+Once tier 1 or 2 resolves a handle, the result is cached for the rest of the
+session, so further URLs from the same account skip the lookups entirely.
+
 Usage:
     python twi2dan.py                    # interactive mode
     python twi2dan.py <url> [<url> ...]  # one or more URLs
@@ -60,6 +63,25 @@ IQDB_URL      = "https://iqdb.org/"
 IQDB_MAX_SIZE = 8 * 1024 * 1024  # 8 MB — IQDB's hard limit
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"}
+
+# ── Session caches ────────────────────────────────────────────────────────────
+# In-memory only, discarded when the process exits. Their sole purpose is to
+# stop a batch of URLs from the same account hammering IQDB and Danbooru with
+# identical questions — one handle should cost one lookup per session.
+#
+# Handles are lowercased before use as keys: Twitter treats @Artist and
+# @artist as the same account, so they must not occupy separate cache entries.
+
+# handle → Danbooru artist tag, recorded only for *confirmed* resolutions
+# (tier 1 or tier 2). A hit skips IQDB and both Danbooru queries.
+# The tier-3 handle fallback is deliberately never stored here — it isn't a
+# real answer, and a later tweet from the account may still land an IQDB match.
+ARTIST_CACHE: dict[str, str] = {}
+
+# Handles that /artists.json has already been asked about and had no artist
+# for. Only tier 2 is skipped on a hit; tier 1 (IQDB) still runs, since it
+# looks at the image rather than the account.
+ARTIST_URL_MISSES: set[str] = set()
 
 
 class AppError(Exception):
@@ -267,6 +289,22 @@ def artist_from_danbooru_post(post_url: str, session: requests.Session, progress
 # ── Danbooru URL fallback ─────────────────────────────────────────────────────
 
 def find_danbooru_artist_by_twitter(twitter_username: str, session: requests.Session, progress, task) -> str | None:
+    """
+    Tier 2: find a Danbooru artist whose profile links to this Twitter handle.
+
+    Danbooru stores artist URLs under both twitter.com and x.com, so both are
+    tried. A confirmed miss is remembered in ARTIST_URL_MISSES so the same
+    fruitless pair of queries isn't repeated for every URL from the account.
+    """
+    handle = twitter_username.lower()
+    if handle in ARTIST_URL_MISSES:
+        progress.update(task, description="[dim]Danbooru: no artist for this handle (already checked this session)[/]")
+        return None
+
+    # Distinguishes "Danbooru says no" from "we never got a usable answer".
+    # Only the former is worth caching — a network blip must not permanently
+    # rule the handle out for the rest of the session.
+    complete = True
     for domain in ("twitter.com", "x.com"):
         url_to_match = f"https://{domain}/{twitter_username}"
         progress.update(task, description=f"[blue]Danbooru:[/] searching artist by Twitter URL…")
@@ -283,14 +321,20 @@ def find_danbooru_artist_by_twitter(twitter_username: str, session: requests.Ses
         try:
             artists = resp.json()
         except ValueError:
+            complete = False  # unreadable answer — this domain proved nothing
             continue
 
         if artists:
+            # Prefer a live artist entry; fall back to the first match if every
+            # candidate is banned or deleted (the tag itself is still valid).
             for artist in artists:
                 if not artist.get("is_banned") and not artist.get("is_deleted"):
                     return artist["name"]
             return artists[0]["name"]
 
+    # Reached only when both domains answered and neither had an artist.
+    if complete:
+        ARTIST_URL_MISSES.add(handle)
     return None
 
 
@@ -416,10 +460,18 @@ def run(tweet_url: str, output_base: Path):
     console.print(f"  {timestamp()} [blue]@{twitter_user}[/]")
     console.print()
 
-    artist_name      = None
+    # Looked up once, up front: `cached_artist` decides whether this URL needs
+    # the full resolution pipeline or can reuse an answer from an earlier URL.
+    cache_key         = twitter_user.lower()
+    cached_artist     = ARTIST_CACHE.get(cache_key)
+    artist_name       = None
     danbooru_post_url = None
     download_error    = None
     session = danbooru_session()
+
+    if cached_artist:
+        console.print(f"  {timestamp()} [dim]artist already resolved this session →[/] [bold green]{cached_artist}[/]")
+        console.print()
 
     with Progress(
         SpinnerColumn(),
@@ -442,27 +494,46 @@ def run(tweet_url: str, output_base: Path):
                 files = []
                 progress.update(task, description=f"[yellow]⚠ Download failed:[/] {download_error}")
 
-            # IQDB reverse search
-            image_files = [f for f in files if f.suffix.lower() in IMAGE_EXTENSIONS]
+            if cached_artist:
+                # An earlier URL in this batch already established the
+                # handle → artist link, so neither IQDB nor Danbooru has
+                # anything left to tell us. Media is still downloaded, it just
+                # goes straight into the folder we already know the name of.
+                artist_name = cached_artist
+                progress.update(task, description=f"[green]✓ Reusing artist[/] [bold]{cached_artist}[/] [dim](cached this session)[/]")
+            else:
+                # Tier 1 — IQDB reverse search. Stops at the first image that
+                # matches a Danbooru post; the 1s pause between images is
+                # IQDB politeness, not a technical requirement.
+                image_files = [f for f in files if f.suffix.lower() in IMAGE_EXTENSIONS]
 
-            if image_files:
-                for img in image_files:
-                    post_url = iqdb_search(img, progress, task)
-                    if post_url:
-                        danbooru_post_url = post_url
-                        break
-                    time.sleep(1)
-            elif not download_error:
-                progress.update(task, description="[yellow]⚠ No images to reverse-search (video only?)[/]")
+                if image_files:
+                    for img in image_files:
+                        post_url = iqdb_search(img, progress, task)
+                        if post_url:
+                            danbooru_post_url = post_url
+                            break
+                        time.sleep(1)
+                elif not download_error:
+                    progress.update(task, description="[yellow]⚠ No images to reverse-search (video only?)[/]")
 
-            # Danbooru artist lookup — without images, IQDB can't run, so we
-            # fall back to the Twitter-handle searches to name the folder.
-            if danbooru_post_url:
-                artist_name = artist_from_danbooru_post(danbooru_post_url, session, progress, task)
+                # Danbooru artist lookup — without images, IQDB can't run, so we
+                # fall back to the Twitter-handle searches to name the folder.
+                if danbooru_post_url:
+                    artist_name = artist_from_danbooru_post(danbooru_post_url, session, progress, task)
 
-            if not artist_name:
-                artist_name = find_danbooru_artist_by_twitter(twitter_user, session, progress, task)
+                # Tier 2 — ask Danbooru which artist claims this handle.
+                if not artist_name:
+                    artist_name = find_danbooru_artist_by_twitter(twitter_user, session, progress, task)
 
+                # Anything reaching here came from tier 1 or 2, i.e. Danbooru
+                # itself vouched for the name — safe to reuse for this handle.
+                if artist_name:
+                    ARTIST_CACHE[cache_key] = artist_name
+
+            # Tier 3 — no confirmed artist. Not cached: the next tweet from
+            # this account may well be indexed on IQDB even though this one
+            # wasn't, and that answer should win over the bare handle.
             if not artist_name:
                 progress.update(task, description="[yellow]⚠ Artist unknown — using Twitter handle[/]")
                 artist_name = twitter_user.lower()
@@ -489,6 +560,8 @@ def run(tweet_url: str, output_base: Path):
     console.print()
     artist_page = f"{DANBOORU_BASE}/posts?tags={artist_name}"
     artist_cell = f"[bold green][link={artist_page}]{artist_name}[/link][/] [blue][link={artist_page}]{artist_page}[/link][/]"
+    if cached_artist:
+        artist_cell += " [dim](reused from earlier in this session)[/]"
 
     table = Table(box=box.ROUNDED, show_header=False, padding=(0, 1))
     table.add_column(style="dim")
@@ -539,6 +612,8 @@ def print_help():
     console.print("  4. Falls back to searching Danbooru by Twitter handle if IQDB fails")
     console.print("  5. Falls back to the Twitter handle as folder name if all else fails")
     console.print("  6. Saves files to [bold]<output_dir>/<artist_name>/[/]")
+    console.print("  Once a handle → artist link is found, it’s reused for the rest of the session")
+    console.print("  [dim](no repeated IQDB or Danbooru lookups for further URLs from the same account).[/]")
     console.print()
 
     console.print("[bold]Credentials[/]")
