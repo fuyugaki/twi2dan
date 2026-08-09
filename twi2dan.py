@@ -62,6 +62,17 @@ DANBOORU_BASE = "https://danbooru.donmai.us"
 IQDB_URL      = "https://iqdb.org/"
 IQDB_MAX_SIZE = 8 * 1024 * 1024  # 8 MB — IQDB's hard limit
 
+# While a query waits, IQDB holds the response open and flushes a
+# <script>queue('<place>', '<own_pending>');</script> tag each time it re-reads
+# the queue. First arg is how many queries sit ahead of ours; second is how many
+# other queries *we* have in flight, which IQDB displays instead of the place.
+IQDB_QUEUE_RE = re.compile(r"queue\('(\d+)',\s*'(\d+)'\)")
+
+# Bytes of already-scanned text to re-examine after a chunk with no match, so a
+# queue() call split across a chunk boundary is still found. Comfortably longer
+# than the ~20-character call itself.
+IQDB_SCAN_OVERLAP = 64
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"}
 
 # ── Session caches ────────────────────────────────────────────────────────────
@@ -183,6 +194,77 @@ def danbooru_get(session: requests.Session, url: str, **kwargs) -> requests.Resp
 
 # ── IQDB lookup ───────────────────────────────────────────────────────────────
 
+def _iqdb_read_stream(resp, image_name: str, progress, task) -> str:
+    """
+    Consume IQDB's chunked response, reporting queue position as it arrives.
+
+    Under load IQDB queues the query and keeps the connection open, flushing an
+    inline queue() <script> tag each time it re-reads the queue (see
+    IQDB_QUEUE_RE). Those tags are meant for a browser to execute as they land,
+    so the position is only useful mid-flight — once the request completes it is
+    stale history, which is why the body has to be read incrementally rather
+    than with a plain buffered `resp.text`.
+
+    `resp` must come from a stream=True request. Returns the whole decoded
+    document, so callers parse exactly what a buffered read would have given.
+    """
+    # Decode as Response.text would: requests sets ISO-8859-1 for text/html
+    # with no charset, so streaming doesn't change how the page is interpreted.
+    # iter_content decodes incrementally and holds back partial multi-byte
+    # sequences, so a character split across two chunks survives intact.
+    resp.encoding = resp.encoding or "utf-8"
+
+    buf = ""
+    scan_from = 0      # start of the region not yet matched against
+    last_seen = None   # last (place, own_pending) rendered, to skip idle redraws
+    searching = False  # results began — the queue line is no longer true
+
+    try:
+        for chunk in resp.iter_content(chunk_size=1024, decode_unicode=True):
+            if not chunk:  # keep-alive chunks carry no payload
+                continue
+            buf += chunk
+
+            # Take the *last* queue() in the new region, not each one: these are
+            # position updates, so if several arrived together only the newest
+            # is still accurate. Older ones would only flicker the spinner.
+            latest = None
+            for m in IQDB_QUEUE_RE.finditer(buf, scan_from):
+                latest = m
+
+            if latest:
+                scan_from = latest.end()
+                place, own_pending = int(latest.group(1)), int(latest.group(2))
+                # IQDB re-sends an unchanged position when nothing drained
+                # between reads; don't redraw for that.
+                if (place, own_pending) != last_seen:
+                    last_seen = (place, own_pending)
+                    if own_pending:
+                        # Our own queries are serialised, so IQDB reports that
+                        # backlog instead of a queue place — mirror its wording.
+                        others = "query" if own_pending == 1 else "queries"
+                        detail = f"waiting on {own_pending} other {others}"
+                    else:
+                        detail = f"queued, place {place}"
+                    progress.update(task, description=f"[blue]IQDB:[/] {image_name} — {detail}…")
+            elif len(buf) - scan_from > IQDB_SCAN_OVERLAP:
+                # No match: skip ahead so the scan stays O(chunk) instead of
+                # re-reading the whole page, but leave a tail behind in case a
+                # queue() call straddles this chunk boundary and completes next.
+                scan_from = len(buf) - IQDB_SCAN_OVERLAP
+
+            # Past the queue and into the results: stop claiming we're waiting.
+            if last_seen and not searching and "Search results" in buf:
+                searching = True
+                progress.update(task, description=f"[blue]IQDB:[/] searching {image_name}…")
+    except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError):
+        # A drop mid-stream leaves a truncated document. Retry it — parsing the
+        # partial page would report "no match" and mis-name the artist folder.
+        raise RetryableError("connection lost mid-search")
+
+    return buf
+
+
 def iqdb_search(image_path: Path, progress, task) -> str | None:
     size = image_path.stat().st_size
     if size > IQDB_MAX_SIZE:
@@ -193,7 +275,11 @@ def iqdb_search(image_path: Path, progress, task) -> str | None:
 
     def _iqdb_post():
         with open(image_path, "rb") as fh:
-            r = requests.post(
+            # stream=True so the queue updates can be read while IQDB is still
+            # working; the body is identical either way, so this costs IQDB
+            # nothing extra. The `with` guarantees the connection is released
+            # even when a status check below bails out early.
+            with requests.post(
                 IQDB_URL,
                 files={"file": (image_path.name, fh)},
                 data={
@@ -201,22 +287,23 @@ def iqdb_search(image_path: Path, progress, task) -> str | None:
                     "service[]": "1",   # Danbooru only — faster lookup
                 },
                 timeout=(10, 90),
-            )
-        if r.status_code == 429:
-            raise RetryableError("rate limit hit")
-        if r.status_code == 503:
-            raise RetryableError("service unavailable")
-        if not r.ok:
-            raise RetryableError(f"HTTP {r.status_code}")
-        return r
+                stream=True,
+            ) as r:
+                if r.status_code == 429:
+                    raise RetryableError("rate limit hit")
+                if r.status_code == 503:
+                    raise RetryableError("service unavailable")
+                if not r.ok:
+                    raise RetryableError(f"HTTP {r.status_code}")
+                return _iqdb_read_stream(r, image_path.name, progress, task)
 
     try:
-        resp = with_retry(_iqdb_post, attempts=3, initial_delay=3.0, label="IQDB", progress=progress, task=task)
+        html = with_retry(_iqdb_post, attempts=3, initial_delay=3.0, label="IQDB", progress=progress, task=task)
     except AppError as e:
         progress.update(task, description=f"[yellow]{e}[/]")
         return None
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(html, "html.parser")
 
     # Check for IQDB error
     err = soup.select_one(".err")
