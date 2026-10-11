@@ -28,6 +28,7 @@ Danbooru auth (optional, avoids rate limits):
 
 import os
 import re
+import sys
 import json
 import shutil
 import argparse
@@ -46,6 +47,12 @@ from rich.table import Table
 from rich import box
 from rich.rule import Rule
 from datetime import datetime
+
+# Redirected output (pipes, files, PowerShell jobs) falls back to the Windows
+# ANSI codepage, which can't encode "→", "✓" etc. Force UTF-8 instead.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 console = Console()
 
@@ -178,6 +185,27 @@ DANBOORU_API_KEY = cfg["danbooru_api_key"]
 def clean_tweet_url(url: str) -> str:
     """Drop share-tracking junk (?s=12&t=…, #fragment) so duplicates collapse."""
     return re.split(r"[?#]", url, maxsplit=1)[0]
+
+
+def is_truncated_share_link(url: str) -> bool:
+    """X share links end in ?s=NN&t=…; ending at ?s=NN means the shell split on '&'."""
+    return bool(re.search(r"\?s=\d+$", url))
+
+
+def alert_unquoted_urls():
+    """Explain the unquoted-'&' mistake. Pops a dialog on Windows when output is
+    hidden (PowerShell turns each '&' into a background job)."""
+    msg = ("Links were cut off at '&' by the shell — nothing was downloaded.\n\n"
+           "Put each URL in quotes:\n"
+           '  python twi2dan.py "https://x.com/…?s=12&t=…"\n\n'
+           "Or delete everything from '?' onward in each link.")
+    console.print(Panel(msg, title="[bold red]✗ Unquoted URLs[/]", border_style="red"))
+    if os.name == "nt" and not sys.stdout.isatty():
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, msg, "twi2dan", 0x30)  # MB_ICONWARNING
+        except Exception:
+            pass
 
 
 def parse_twitter_username(tweet_url: str) -> str | None:
@@ -806,6 +834,10 @@ def main():
     # URLs on the command line mean "just download these": no prompts, any
     # missing setting falls back to its default.
     direct = bool(args.tweet_urls)
+
+    if any(is_truncated_share_link(u) for u in args.tweet_urls):
+        alert_unquoted_urls()
+        sys.exit(2)
 
     console.print(Panel.fit(
         "[bold]twi2dan[/]  [dim]Twitter/X → Danbooru artist folder[/]",

@@ -160,7 +160,8 @@ Starts downloading immediately — no prompts.
 - Danbooru credentials come from env vars or `.twi2dan.json`; otherwise anonymous.
 - Tracking params (`?s=12&t=…`) are stripped; duplicate links are downloaded once.
 
-**Quote every URL.** An unquoted `&` cuts the link off (cmd) or errors (PowerShell).
+**Quote every URL.** An unquoted `&` cuts the link off (cmd) or splits the command into background jobs (PowerShell 7).
+If a link arrives cut off at `?s=12`, twi2dan downloads nothing and shows an alert (a pop-up when PowerShell hid it in a background job).
 
 ```
 python twi2dan.py "https://x.com/someartist/status/123456789?s=12&t=abc"
