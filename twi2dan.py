@@ -75,6 +75,18 @@ IQDB_SCAN_OVERLAP = 64
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"}
 
+# Danbooru tags marking a post as made (wholly or partly) with generative AI.
+# Only canonical names are needed — Danbooru resolves aliases such as
+# "AIart" or "NovelAI" to these before they reach a post's tag_string.
+AI_TAGS = (
+    "ai-generated",
+    "ai-assisted",
+    "ai-generated_background",
+    "ai-generated_inset",
+    "stable_diffusion",
+    "nai_diffusion",
+)
+
 # ── Session caches ────────────────────────────────────────────────────────────
 # In-memory only, discarded when the process exits. Their sole purpose is to
 # stop a batch of URLs from the same account hammering IQDB and Danbooru with
@@ -88,6 +100,12 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"}
 # The tier-3 handle fallback is deliberately never stored here — it isn't a
 # real answer, and a later tweet from the account may still land an IQDB match.
 ARTIST_CACHE: dict[str, str] = {}
+
+# handle → AI tags on the Danbooru post that resolved it, stored alongside
+# every ARTIST_CACHE entry (empty when the post had none, or when tier 2
+# resolved the artist without a post). Since a cache hit skips IQDB, this is
+# the only way later URLs from the account can still carry the AI warning.
+ARTIST_AI_TAGS: dict[str, list[str]] = {}
 
 # Handles that /artists.json has already been asked about and had no artist
 # for. Only tier 2 is skipped on a hit; tier 1 (IQDB) still runs, since it
@@ -156,6 +174,11 @@ DANBOORU_API_KEY = cfg["danbooru_api_key"]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def clean_tweet_url(url: str) -> str:
+    """Drop share-tracking junk (?s=12&t=…, #fragment) so duplicates collapse."""
+    return re.split(r"[?#]", url, maxsplit=1)[0]
+
 
 def parse_twitter_username(tweet_url: str) -> str | None:
     m = re.search(r"(?:twitter\.com|x\.com)/([^/?\s]+)/status/", tweet_url)
@@ -343,10 +366,11 @@ def iqdb_search(image_path: Path, progress, task) -> str | None:
     return None
 
 
-def artist_from_danbooru_post(post_url: str, session: requests.Session, progress, task) -> str | None:
+def artist_from_danbooru_post(post_url: str, session: requests.Session, progress, task) -> tuple[str | None, list[str]]:
+    """Return (artist tag, AI tags found on the post)."""
     m = re.search(r"/posts/(\d+)", post_url)
     if not m:
-        return None
+        return None, []
     post_id = m.group(1)
 
     progress.update(task, description=f"[blue]Danbooru:[/] fetching post {post_id}…")
@@ -357,20 +381,23 @@ def artist_from_danbooru_post(post_url: str, session: requests.Session, progress
         )
     except AppError as e:
         progress.update(task, description=f"[yellow]⚠ Danbooru post:[/] {e}")
-        return None
+        return None, []
 
     try:
         post = resp.json()
     except ValueError:
         progress.update(task, description="[yellow]⚠ Danbooru:[/] invalid JSON response")
-        return None
+        return None, []
+
+    post_tags = set(post.get("tag_string", "").split())
+    ai_tags   = [t for t in AI_TAGS if t in post_tags]
 
     tag_string_artist = post.get("tag_string_artist", "").strip()
     if not tag_string_artist:
         progress.update(task, description="[yellow]⚠ Danbooru:[/] post has no artist tag")
-        return None
+        return None, ai_tags
 
-    return tag_string_artist.split()[0]
+    return tag_string_artist.split()[0], ai_tags
 
 
 # ── Danbooru URL fallback ─────────────────────────────────────────────────────
@@ -553,6 +580,7 @@ def run(tweet_url: str, output_base: Path):
     cached_artist     = ARTIST_CACHE.get(cache_key)
     artist_name       = None
     danbooru_post_url = None
+    ai_tags           = ARTIST_AI_TAGS.get(cache_key, []) if cached_artist else []
     download_error    = None
     session = danbooru_session()
 
@@ -607,7 +635,7 @@ def run(tweet_url: str, output_base: Path):
                 # Danbooru artist lookup — without images, IQDB can't run, so we
                 # fall back to the Twitter-handle searches to name the folder.
                 if danbooru_post_url:
-                    artist_name = artist_from_danbooru_post(danbooru_post_url, session, progress, task)
+                    artist_name, ai_tags = artist_from_danbooru_post(danbooru_post_url, session, progress, task)
 
                 # Tier 2 — ask Danbooru which artist claims this handle.
                 if not artist_name:
@@ -616,7 +644,8 @@ def run(tweet_url: str, output_base: Path):
                 # Anything reaching here came from tier 1 or 2, i.e. Danbooru
                 # itself vouched for the name — safe to reuse for this handle.
                 if artist_name:
-                    ARTIST_CACHE[cache_key] = artist_name
+                    ARTIST_CACHE[cache_key]   = artist_name
+                    ARTIST_AI_TAGS[cache_key] = ai_tags
 
             # Tier 3 — no confirmed artist. Not cached: the next tweet from
             # this account may well be indexed on IQDB even though this one
@@ -656,12 +685,23 @@ def run(tweet_url: str, output_base: Path):
     table.add_row("Artist", artist_cell)
     if danbooru_post_url:
         table.add_row("Post", f"[link={danbooru_post_url}]{danbooru_post_url}[/link]")
+    if ai_tags:
+        ai_cell = f"[bold red]⚠ {', '.join(ai_tags)}[/]"
+        if cached_artist:
+            ai_cell += " [dim](from an earlier post this session)[/]"
+        table.add_row("AI", ai_cell)
     table.add_row("Folder", str(artist_folder))
     table.add_row("Files",  str(len(moved)))
     if download_error:
         table.add_row("Download", f"[yellow]failed — {download_error}[/]")
     console.print(table)
     console.print()
+    if ai_tags:
+        if cached_artist:
+            console.print(f"  [bold red]⚠ An earlier Danbooru match from this account is tagged as AI art ({', '.join(ai_tags)}).[/]")
+        else:
+            console.print(f"  [bold red]⚠ The matched Danbooru post is tagged as AI art ({', '.join(ai_tags)}).[/]")
+        console.print()
     if download_error:
         console.print(f"  [yellow]⚠ No media downloaded — folder created empty for manual use.[/]")
     for f in moved:
@@ -689,7 +729,10 @@ def print_help():
     console.print("  [blue]Command line[/]")
     console.print("    [dim]python twi2dan.py <url> [url ...][/]")
     console.print("    [dim]python twi2dan.py <url> --output-dir PATH[/]")
-    console.print("    Pass one or more tweet URLs directly. Output dir defaults to ~/Downloads.")
+    console.print("    Pass one or more tweet URLs to start downloading right away — no prompts.")
+    console.print("    Output dir defaults to ~/Downloads; Danbooru credentials come from env/config only.")
+    console.print("    [yellow]⚠[/] Wrap URLs containing [bold]&[/] in quotes, or the shell cuts them off:")
+    console.print('    [dim]python twi2dan.py "https://x.com/user/status/123?s=12&t=abc"[/]')
     console.print()
 
     console.print("[bold]How it works[/]")
@@ -760,6 +803,10 @@ def main():
     parser.add_argument("--output-dir", "-o", default=None, help="Base output directory")
     args = parser.parse_args()
 
+    # URLs on the command line mean "just download these": no prompts, any
+    # missing setting falls back to its default.
+    direct = bool(args.tweet_urls)
+
     console.print(Panel.fit(
         "[bold]twi2dan[/]  [dim]Twitter/X → Danbooru artist folder[/]",
         border_style="bright_blue",
@@ -769,7 +816,10 @@ def main():
     # Danbooru credentials
     global DANBOORU_USER, DANBOORU_API_KEY
     if not DANBOORU_USER or not DANBOORU_API_KEY:
-        if Confirm.ask("[bold]Set Danbooru credentials?[/] [dim](recommended, avoids rate limits)[/]", default=False):
+        if direct:
+            console.print("  [blue]Danbooru:[/] anonymous [dim](run without URLs to set credentials)[/]")
+            console.print()
+        elif Confirm.ask("[bold]Set Danbooru credentials?[/] [dim](recommended, avoids rate limits)[/]", default=False):
             DANBOORU_USER    = Prompt.ask("  [bold]Danbooru username[/]").strip()
             DANBOORU_API_KEY = Prompt.ask("  [bold]Danbooru API key[/]", password=True).strip()
             if DANBOORU_USER and DANBOORU_API_KEY:
@@ -786,7 +836,9 @@ def main():
     output_dir = args.output_dir
     if not output_dir:
         default = str(Path.home() / "Downloads")
-        while True:
+        if direct:
+            output_dir = default
+        while not output_dir:
             raw = Prompt.ask("[bold]Output directory[/]", default=default).strip().strip('"\'') or default
             if re.match(r"https?://", raw):
                 console.print(f"  [yellow]⚠[/]  That looks like a URL, not a directory. Using default: [dim]{default}[/]")
@@ -803,11 +855,14 @@ def main():
             break
 
     output_base = Path(output_dir).resolve()
+    if direct:
+        console.print(f"  [blue]Output:[/] {output_base}")
 
     # URLs — from CLI args or interactive prompt loop
     seen = set()
     urls = []
     for u in args.tweet_urls:
+        u = clean_tweet_url(u)
         if u not in seen:
             seen.add(u)
             urls.append(u)
@@ -824,6 +879,7 @@ def main():
                 if not re.match(r"https?://", u):
                     console.print(f"  [yellow]⚠ Skipping non-URL:[/] {u}")
                     continue
+                u = clean_tweet_url(u)
                 if u not in seen:
                     seen.add(u)
                     urls.append(u)

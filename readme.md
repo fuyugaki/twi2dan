@@ -39,6 +39,10 @@ You may occasionally see `waiting on 2 other queries` instead of a place. That�
 
 Nothing is displayed when IQDB isn’t busy, because it doesn’t queue the query at all — the search just returns.
 
+### AI art warning
+
+If the matched Danbooru post is tagged `ai-generated`, `ai-assisted`, `ai-generated_background`, `ai-generated_inset`, `stable_diffusion` or `nai_diffusion`, the summary shows an **AI** row and a warning. The flag is cached with the artist, so later tweets from the same account show it too.
+
 ### Artist lookups are cached per session
 
 The first time a handle is resolved to a Danbooru artist (step 3 or 4 above), the link is remembered for the rest of the run. Every further URL from that same account goes straight to the known folder — no IQDB upload, no Danbooru query:
@@ -112,7 +116,7 @@ Run once while logged into X. Make sure NSFW content is enabled in your account 
 
 Not required, but recommended to avoid rate limits on the API.
 
-Credentials are stored in `.twi2dan.json` in the same folder as the script and prompted on first run.
+Prompted for in interactive mode and optionally saved to `.twi2dan.json` next to the script.
 
 Alternatively, set environment variables:
 ```
@@ -147,14 +151,20 @@ Tweet URL (empty when done):
 
 ### Command line
 ```
-python twi2dan.py <url> [url ...]
-python twi2dan.py <url> [url ...] --output-dir PATH
+python twi2dan.py "<url>" ["<url>" ...] [--output-dir PATH]
 ```
 
-Examples:
+Starts downloading immediately — no prompts.
+
+- Output defaults to `~/Downloads`.
+- Danbooru credentials come from env vars or `.twi2dan.json`; otherwise anonymous.
+- Tracking params (`?s=12&t=…`) are stripped; duplicate links are downloaded once.
+
+**Quote every URL.** An unquoted `&` cuts the link off (cmd) or errors (PowerShell).
+
 ```
-python twi2dan.py https://x.com/someartist/status/123456789
-python twi2dan.py https://x.com/a/status/111 https://x.com/b/status/222 --output-dir D:\art
+python twi2dan.py "https://x.com/someartist/status/123456789?s=12&t=abc"
+python twi2dan.py "https://x.com/a/status/111" "https://x.com/b/status/222" --output-dir D:\art
 ```
 
 ### In-app help
